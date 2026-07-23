@@ -1,0 +1,14 @@
+k8s-agent has been installed in namespace {{ .Release.Namespace }}.
+
+Verify the operator is running:
+
+  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }}
+
+Check the logs:
+
+  kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }} -f
+
+{{- if not .Values.writer.enabled }}
+
+Note: the control executor (writer) is DISABLED; the agent is running read-only.
+{{- end }}

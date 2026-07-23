@@ -1,0 +1,118 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "k8s-agent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "k8s-agent.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "k8s-agent.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "k8s-agent.selectorLabels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      # The pod's own (default) token is the least-privileged reader SA, and
+      # default token automount is disabled: both SAs are wired in via
+      # projected serviceAccountToken volumes below.
+      serviceAccountName: agent-reader
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: operator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: SERVER_ENDPOINT
+              value: {{ required "server.endpoint is required" .Values.server.endpoint | quote }}
+            - name: SERVER_PUBLIC_KEY
+              value: {{ required "server.publicKey is required" .Values.server.publicKey | quote }}
+            - name: SERVER_TOKEN
+              value: {{ required "server.token is required" .Values.server.token | quote }}
+            - name: WRITER_ENABLED
+              value: {{ .Values.writer.enabled | quote }}
+            - name: DRY_RUN_FIRST
+              value: {{ .Values.writer.dryRunFirst | quote }}
+            - name: DRIFT_POLICY
+              value: {{ .Values.writer.driftPolicy | quote }}
+            - name: INFORMERS_ENABLED
+              value: {{ join "," .Values.informers.enabled | quote }}
+            - name: PROTECTED_NAMESPACES
+              value: "kube-system,k8s-agent-system"
+            - name: LOG_LEVEL
+              value: {{ .Values.logging.level | quote }}
+            - name: POLL_INTERVAL
+              value: {{ .Values.poller.interval | quote }}
+            - name: READER_TOKEN_PATH
+              value: /var/run/secrets/agent-reader/token
+            - name: WRITER_TOKEN_PATH
+              value: /var/run/secrets/agent-writer/token
+            - name: METRICS_ADDR
+              value: ":9090"
+            - name: SPILL_DIR
+              value: /var/lib/k8s-agent/spill
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9090
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 9090
+            initialDelaySeconds: 5
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: agent-reader-token
+              mountPath: /var/run/secrets/agent-reader
+              readOnly: true
+            {{- if .Values.writer.enabled }}
+            - name: agent-writer-token
+              mountPath: /var/run/secrets/agent-writer
+              readOnly: true
+            {{- end }}
+            - name: spill
+              mountPath: /var/lib/k8s-agent/spill
+      volumes:
+        - name: agent-reader-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+        {{- if .Values.writer.enabled }}
+        - name: agent-writer-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+        {{- end }}
+        - name: spill
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

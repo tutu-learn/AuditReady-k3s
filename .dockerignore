@@ -1,0 +1,8 @@
+.git
+.idea
+bin/
+charts/
+*.md
+.github/
+Dockerfile
+.dockerignore

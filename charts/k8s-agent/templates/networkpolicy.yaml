@@ -1,0 +1,35 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "k8s-agent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "k8s-agent.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "k8s-agent.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  # Deny all ingress (metrics scraping must be allowed explicitly if needed).
+  ingress: []
+  egress:
+    # DNS resolution via kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # HTTPS to the control plane endpoint. The endpoint is external, so this
+    # allows TCP 443 anywhere; tighten to specific ipBlock CIDRs for your
+    # control plane if desired.
+    - ports:
+        - protocol: TCP
+          port: 443
+{{- end }}

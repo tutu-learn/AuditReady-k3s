@@ -1,0 +1,92 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/tutu-learn/k8s-agent-operator
+  # tag defaults to .Chart.AppVersion when empty
+  tag: ""
+  pullPolicy: IfNotPresent
+
+server:
+  endpoint: ""   # required, e.g. https://control-plane.your-org.example/audit_ready
+  publicKey: ""  # required, base64 ed25519 public key of the control plane
+  # required, long-lived agent token issued by the control plane UI, scoped to
+  # one cluster; consider wiring a Secret reference in production instead of
+  # passing it inline
+  token: ""
+
+# Kubernetes resource kinds the information gatherer watches.
+informers:
+  enabled:
+    - deployments
+    - statefulsets
+    - daemonsets
+    - replicasets
+    - pods
+    - services
+    - ingresses
+    - configmaps
+    - secrets
+    - nodes
+    - namespaces
+    - persistentvolumeclaims
+    - roles
+    - rolebindings
+    - clusterroles
+    - clusterrolebindings
+    - serviceaccounts
+    - networkpolicies
+    - poddisruptionbudgets
+    - certificates
+    - issuers
+    - clusterissuers
+
+writer:
+  # When false, the agent-writer ServiceAccount, ClusterRole/Binding and
+  # writer token mount are not rendered, and the operator runs read-only.
+  enabled: true
+  dryRunFirst: true
+  # refuse | overwrite | overwrite-with-approval
+  driftPolicy: refuse
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 200Mi
+  limits:
+    cpu: 500m
+    memory: 500Mi
+
+networkPolicy:
+  enabled: true
+
+logging:
+  level: info # debug | info | warn | error
+
+poller:
+  interval: 30s # how often the operator polls the control plane for commands
+
+# Reserved for future per-ServiceAccount annotations:
+# serviceAccount:
+#   reader:
+#     annotations: {}
+#   writer:
+#     annotations: {}
+serviceAccount: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  fsGroup: 65534
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - "ALL"
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
