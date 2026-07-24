@@ -26,14 +26,16 @@ import (
 )
 
 const (
-	defaultCapacity  = 10000
-	batchSize        = 200
-	flushInterval    = time.Second
-	initialBackoff   = time.Second
-	maxBackoff       = 30 * time.Second
-	spillFileName    = "spill.jsonl"
-	seqFileName      = "seq"
-	maxSpillLineSize = 10 << 20 // 10 MiB scanner buffer
+	defaultCapacity      = 10000
+	batchSize            = 200
+	defaultMaxBatchBytes = 512 << 10 // stay under small ingress client_max_body_size
+	eventOverhead        = 256       // estimated JSON field overhead per event
+	flushInterval        = time.Second
+	initialBackoff       = time.Second
+	maxBackoff           = 30 * time.Second
+	spillFileName        = "spill.jsonl"
+	seqFileName          = "seq"
+	maxSpillLineSize     = 10 << 20 // 10 MiB scanner buffer
 )
 
 // BatchSender POSTs one inventory batch to the control plane and returns
@@ -58,6 +60,9 @@ type Uploader struct {
 
 	capacity int
 
+	// maxBatchBytes caps a batch's estimated wire size; overridable in tests.
+	maxBatchBytes int
+
 	mu        sync.Mutex
 	buf       []*protocol.InventoryEvent
 	spill     *os.File
@@ -81,16 +86,17 @@ func New(cfg *config.Config, send BatchSender, snap Snapshotter, log *slog.Logge
 func NewWithCapacity(cfg *config.Config, send BatchSender, snap Snapshotter, log *slog.Logger, capacity int) *Uploader {
 	seqPath := filepath.Join(cfg.SpillDir, seqFileName)
 	return &Uploader{
-		cfg:          cfg,
-		send:         send,
-		snap:         snap,
-		log:          log,
-		capacity:     capacity,
-		spillPath:    filepath.Join(cfg.SpillDir, spillFileName),
-		notify:       make(chan struct{}, 1),
-		seqPath:      seqPath,
-		seq:          readSeq(seqPath, log),
-		needSnapshot: true,
+		cfg:           cfg,
+		send:          send,
+		snap:          snap,
+		log:           log,
+		capacity:      capacity,
+		maxBatchBytes: defaultMaxBatchBytes,
+		spillPath:     filepath.Join(cfg.SpillDir, spillFileName),
+		notify:        make(chan struct{}, 1),
+		seqPath:       seqPath,
+		seq:           readSeq(seqPath, log),
+		needSnapshot:  true,
 	}
 }
 
@@ -169,11 +175,12 @@ func (u *Uploader) sendSnapshot(ctx context.Context) error {
 		return nil
 	}
 	events := u.snap.Snapshot()
-	for start := 0; start < len(events); start += batchSize {
-		end := min(start+batchSize, len(events))
-		if err := u.sendBatch(ctx, events[start:end], true); err != nil {
+	for len(events) > 0 {
+		n := batchLen(events, batchSize, u.maxBatchBytes)
+		if err := u.sendBatch(ctx, events[:n], true); err != nil {
 			return err
 		}
+		events = events[n:]
 	}
 	return nil
 }
@@ -203,7 +210,8 @@ func (u *Uploader) sendBatch(ctx context.Context, events []*protocol.InventoryEv
 }
 
 // take pops up to n events from the front of the buffer, replaying spilled
-// events first when the buffer has drained.
+// events first when the buffer has drained. The batch also closes at the
+// byte budget (see batchLen).
 func (u *Uploader) take(n int) []*protocol.InventoryEvent {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -213,7 +221,7 @@ func (u *Uploader) take(n int) []*protocol.InventoryEvent {
 	if len(u.buf) == 0 {
 		return nil
 	}
-	n = min(n, len(u.buf))
+	n = batchLen(u.buf, n, u.maxBatchBytes)
 	out := make([]*protocol.InventoryEvent, n)
 	copy(out, u.buf[:n])
 	u.buf = u.buf[n:]
@@ -222,6 +230,27 @@ func (u *Uploader) take(n int) []*protocol.InventoryEvent {
 	}
 	metrics.SetQueueDepth(len(u.buf))
 	return out
+}
+
+// batchLen returns how many leading events fit in one batch: at most
+// maxEvents, closing before the first event that would push the estimated
+// size past maxBytes — but always at least one, so an event larger than the
+// budget goes out alone instead of looping forever.
+func batchLen(events []*protocol.InventoryEvent, maxEvents, maxBytes int) int {
+	n := min(maxEvents, len(events))
+	bytes := eventSize(events[0])
+	i := 1
+	for i < n && bytes+eventSize(events[i]) <= maxBytes {
+		bytes += eventSize(events[i])
+		i++
+	}
+	return i
+}
+
+// eventSize estimates an event's wire size: the object payload plus a fixed
+// overhead for the remaining JSON fields. Cheap and good enough.
+func eventSize(ev *protocol.InventoryEvent) int {
+	return len(ev.ObjectJSON) + eventOverhead
 }
 
 // requeueFront puts a failed batch back at the front of the buffer.

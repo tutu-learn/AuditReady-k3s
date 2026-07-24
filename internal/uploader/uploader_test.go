@@ -78,6 +78,13 @@ func ev(name string) *protocol.InventoryEvent {
 	}
 }
 
+// evSized returns an event whose estimated size is len(objectJSON)+256.
+func evSized(name string, objectBytes int) *protocol.InventoryEvent {
+	e := ev(name)
+	e.ObjectJSON = make([]byte, objectBytes)
+	return e
+}
+
 // collect reads n events from the sender's accepted batches, preserving order.
 func collect(t *testing.T, f *fakeSender, n int) []*protocol.InventoryBatch {
 	t.Helper()
@@ -294,6 +301,93 @@ func TestAuthErrorKeepsBackingOff(t *testing.T) {
 	}
 	if attempts > 2 {
 		t.Errorf("hot spin on AuthError: %d attempts in 600ms", attempts)
+	}
+}
+
+func TestBatchByteBudgetSnapshot(t *testing.T) {
+	sender := newFakeSender()
+	// 1 KiB budget, events of 44+256=300 estimated bytes each: three fit
+	// (900), a fourth would exceed the budget (1200), so it starts a new
+	// batch — even in the full snapshot.
+	snap := staticSnapshotter{events: []*protocol.InventoryEvent{
+		evSized("a", 44), evSized("b", 44), evSized("c", 44), evSized("d", 44),
+	}}
+	u := New(testConfig(t), sender.send, snap, testLogger())
+	u.maxBatchBytes = 1024
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go u.Run(ctx)
+
+	batches := collect(t, sender, 4)
+	if len(batches) != 2 {
+		t.Fatalf("expected 2 batches, got %d", len(batches))
+	}
+	if !batches[0].Full || !batches[1].Full {
+		t.Error("both batches must be part of the full snapshot")
+	}
+	if len(batches[0].Events) != 3 || len(batches[1].Events) != 1 {
+		t.Errorf("batch sizes = %d, %d; want 3, 1", len(batches[0].Events), len(batches[1].Events))
+	}
+	got := eventsOf(batches)
+	for i, name := range []string{"a", "b", "c", "d"} {
+		if got[i].Ref.Name != name {
+			t.Errorf("event %d = %q, want %q (order must be preserved)", i, got[i].Ref.Name, name)
+		}
+	}
+}
+
+func TestOversizedEventSentAlone(t *testing.T) {
+	sender := newFakeSender()
+	u := New(testConfig(t), sender.send, staticSnapshotter{}, testLogger())
+	u.maxBatchBytes = 1024
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go u.Run(ctx)
+
+	// The big event (2000+256 estimated bytes) exceeds the budget: it must
+	// go out alone, neither dropped nor stuck, with order preserved.
+	u.Enqueue(evSized("small-1", 44))
+	u.Enqueue(evSized("big", 2000))
+	u.Enqueue(evSized("small-2", 44))
+
+	batches := collect(t, sender, 3)
+	if len(batches) != 3 {
+		t.Fatalf("expected 3 batches, got %d", len(batches))
+	}
+	for i, b := range batches {
+		if len(b.Events) != 1 {
+			t.Fatalf("batch %d has %d events, want 1", i, len(b.Events))
+		}
+	}
+	for i, name := range []string{"small-1", "big", "small-2"} {
+		if batches[i].Events[0].Ref.Name != name {
+			t.Errorf("batch %d = %q, want %q", i, batches[i].Events[0].Ref.Name, name)
+		}
+	}
+}
+
+func TestCountCapStillWorks(t *testing.T) {
+	sender := newFakeSender()
+	u := New(testConfig(t), sender.send, staticSnapshotter{}, testLogger())
+
+	// 250 small events: well under the default byte budget, so the
+	// 200-event count cap must split them 200 + 50.
+	for i := 0; i < 250; i++ {
+		u.Enqueue(ev("e"))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go u.Run(ctx)
+
+	batches := collect(t, sender, 250)
+	if len(batches) != 2 {
+		t.Fatalf("expected 2 batches, got %d", len(batches))
+	}
+	if len(batches[0].Events) != 200 || len(batches[1].Events) != 50 {
+		t.Errorf("batch sizes = %d, %d; want 200, 50", len(batches[0].Events), len(batches[1].Events))
 	}
 }
 
