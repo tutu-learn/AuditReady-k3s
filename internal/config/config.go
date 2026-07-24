@@ -5,6 +5,7 @@ package config
 import (
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strconv"
@@ -107,16 +108,17 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// PublicKey decodes the configured base64 Ed25519 public key.
+// PublicKey decodes the configured Ed25519 public key. Both encodings are
+// accepted: base64 (32 bytes decoded, per the protocol spec) and plain hex
+// (64 chars), since the control plane's key store holds hex.
 func (c *Config) PublicKey() (ed25519.PublicKey, error) {
-	raw, err := base64.StdEncoding.DecodeString(c.ServerPublicKey)
-	if err != nil {
-		return nil, fmt.Errorf("not valid base64: %w", err)
+	if raw, err := base64.StdEncoding.DecodeString(c.ServerPublicKey); err == nil && len(raw) == ed25519.PublicKeySize {
+		return ed25519.PublicKey(raw), nil
 	}
-	if len(raw) != ed25519.PublicKeySize {
-		return nil, fmt.Errorf("expected %d bytes, got %d", ed25519.PublicKeySize, len(raw))
+	if raw, err := hex.DecodeString(c.ServerPublicKey); err == nil && len(raw) == ed25519.PublicKeySize {
+		return ed25519.PublicKey(raw), nil
 	}
-	return ed25519.PublicKey(raw), nil
+	return nil, fmt.Errorf("expected a 32-byte Ed25519 public key as base64 or hex (got %d chars)", len(c.ServerPublicKey))
 }
 
 // EndpointBase returns the endpoint with any trailing slash trimmed, ready

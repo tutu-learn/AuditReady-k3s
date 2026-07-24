@@ -344,6 +344,8 @@ on older sites are harmless.)
 - 401/403 surface as `protocol.AuthError` and are logged loudly ("check
   SERVER_TOKEN"); the agent keeps backing off — rotate the token and restart
   the pod to recover.
+- `SERVER_PUBLIC_KEY` accepts the 32-byte key in base64 (per this spec) or
+  plain hex (the encoding the `k8s_server_keys` table stores).
 - A local mock of this protocol ships in `cmd/mockserver`
   (`go run ./cmd/mockserver -token dev-token -command-file commands.json` —
   it prints `SERVER_TOKEN` and `SERVER_PUBLIC_KEY` for the agent's env).
