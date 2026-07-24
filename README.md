@@ -74,12 +74,17 @@ The token is long-lived and scoped to one cluster — it works until revoked. To
 `.github/workflows/ci.yaml` runs tests on every push/PR, and on pushes to
 `main` and `v*` tags publishes:
 
-- **Image** — `ghcr.io/tutu-learn/k8s-agent-operator` (tags: `latest` on
-  main, short-SHA on every push, semver on `v*` tags; linux/amd64+arm64)
-- **Chart** — `oci://ghcr.io/tutu-learn/charts/k8s-agent` (version = tag
-  without the `v`, or `0.0.0-<sha>` on main)
+- **Image** — `ghcr.io/tutu-learn/k8s-agent-operator` (linux/amd64+arm64)
+- **Chart** — `oci://ghcr.io/tutu-learn/charts/k8s-agent`
 
-Cut a release with `git tag v0.1.0 && git push --tags`. First-time push note:
+Versioning is automatic: every green `main` build publishes chart and image
+as `0.1.<CI run number>` (plus `latest` for the image) — a stable,
+monotonically increasing version, so `helm install oci://...` with no
+`--version` always gets the newest build, and `helm upgrade` picks up each
+new push. Tagging `v1.2.3` additionally publishes chart and image as `1.2.3`
+for explicit releases.
+
+First-time push note:
 GHCR packages inherit repo visibility — after the first CI run, make the
 `k8s-agent-operator` and `charts/k8s-agent` packages public (or connect them
 to the repo) under github.com/users/tutu-learn/packages. If they stay
