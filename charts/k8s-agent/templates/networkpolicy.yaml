@@ -26,10 +26,15 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
-    # HTTPS to the control plane endpoint. The endpoint is external, so this
-    # allows TCP 443 anywhere; tighten to specific ipBlock CIDRs for your
-    # control plane if desired.
+    # TCP 443 anywhere: the control plane endpoint (external) AND the
+    # Kubernetes API server. TCP 6443: pods dial the API via its ClusterIP
+    # (:443), but kube-proxy DNATs to the real endpoint, which commonly
+    # listens on :6443 (possibly an external IP) — and Calico evaluates
+    # egress post-DNAT on this path, so both ports must be allowed.
+    # Tighten the control plane leg to specific ipBlock CIDRs if desired.
     - ports:
         - protocol: TCP
           port: 443
+        - protocol: TCP
+          port: 6443
 {{- end }}
