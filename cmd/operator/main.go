@@ -9,8 +9,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -48,18 +50,27 @@ func run() error {
 
 	// kubeConfigFor builds a rest.Config authenticated with the given SA token
 	// file. With KUBECONFIG set (local development) both paths share the
-	// kubeconfig credentials instead.
+	// kubeconfig credentials instead. In-cluster the pod has no classic
+	// serviceaccount automount (automountServiceAccountToken: false), so the
+	// config is assembled from the projected token and CA files.
 	kubeConfigFor := func(tokenPath string) (*rest.Config, error) {
 		if kubeconfig := os.Getenv("KUBECONFIG"); kubeconfig != "" {
 			return clientcmd.BuildConfigFromFlags("", kubeconfig)
 		}
-		rc, err := rest.InClusterConfig()
-		if err != nil {
-			return nil, err
+		host, port := os.Getenv("KUBERNETES_SERVICE_HOST"), os.Getenv("KUBERNETES_SERVICE_PORT")
+		if host == "" || port == "" {
+			return nil, fmt.Errorf("not in a cluster (KUBERNETES_SERVICE_HOST/PORT unset) and KUBECONFIG is not set")
 		}
-		rc.BearerToken = ""
-		rc.BearerTokenFile = tokenPath
-		return rc, nil
+		caFile := filepath.Join(filepath.Dir(tokenPath), "ca.crt")
+		if _, err := os.Stat(caFile); err != nil {
+			// Fall back to the classic automount layout if it exists.
+			return rest.InClusterConfig()
+		}
+		return &rest.Config{
+			Host:            "https://" + net.JoinHostPort(host, port),
+			BearerTokenFile: tokenPath,
+			TLSClientConfig: rest.TLSClientConfig{CAFile: caFile},
+		}, nil
 	}
 
 	readerCfg, err := kubeConfigFor(cfg.ReaderTokenPath)

@@ -94,6 +94,13 @@ spec:
               - serviceAccountToken:
                   path: token
                   expirationSeconds: 3600
+              # cluster CA for the API-server TLS handshake (no classic
+              # automount, so kube-root-ca.crt is projected explicitly)
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
         {{- if .Values.writer.enabled }}
         - name: agent-writer-token
           projected:
@@ -101,6 +108,11 @@ spec:
               - serviceAccountToken:
                   path: token
                   expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
         {{- end }}
         - name: spill
           emptyDir: {}
