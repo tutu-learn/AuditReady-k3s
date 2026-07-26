@@ -267,8 +267,12 @@ func TestDrainNode(t *testing.T) {
 	dsPod.OwnerReferences = []metav1.OwnerReference{{Kind: "DaemonSet", APIVersion: "apps/v1", Name: "ds"}}
 	mirrorPod := mkPod("mirror-pod")
 	mirrorPod.Annotations = map[string]string{"kubernetes.io/config.mirror": "x"}
+	// Pods in protected namespaces (e.g. the agent's own) must survive the
+	// drain: evicting the agent cancels this very command via SIGTERM.
+	protectedPod := mkPod("agent-pod")
+	protectedPod.Namespace = "kube-system" // testConfig protects kube-system
 
-	kube := kubefake.NewSimpleClientset(node, mkPod("p1"), mkPod("p2"), dsPod, mirrorPod)
+	kube := kubefake.NewSimpleClientset(node, mkPod("p1"), mkPod("p2"), dsPod, mirrorPod, protectedPod)
 	e := newExecutor(testConfig(), dynfake.NewSimpleDynamicClient(runtime.NewScheme()), kube)
 	rec := &recorder{}
 

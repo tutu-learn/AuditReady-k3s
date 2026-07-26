@@ -45,7 +45,7 @@ The operator is one binary but runs as two logically separate subsystems, each w
                   RBAC decides per call
 ```
 
-Two ServiceAccounts, two projected token files (`/var/run/secrets/agent-reader`, `/var/run/secrets/agent-writer`), two ClusterRoleBindings. The read path holds only a read-only dynamic client and physically cannot mutate the cluster. Neither account gets `cluster-admin`. If the writer token is absent the process forces read-only mode.
+Two ServiceAccounts, two token files (`/var/run/secrets/agent-reader`, `/var/run/secrets/agent-writer`), two ClusterRoleBindings. The reader token is a projected serviceAccountToken volume; the writer token comes from a classic token Secret because projections can only mint tokens for the pod's own SA. The read path holds only a read-only dynamic client and physically cannot mutate the cluster. Neither account gets `cluster-admin`. If the writer token is absent the process forces read-only mode.
 
 ## Requirements
 

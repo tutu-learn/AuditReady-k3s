@@ -310,9 +310,11 @@ func (e *Executor) delete(ctx context.Context, cmd *protocol.Command, report fun
 	e.succeed(cmd, report, fmt.Sprintf("deleted %s %s/%s", cmd.Target.Resource, ns, name))
 }
 
-// drainNode cordons the node and evicts every pod except mirror and
-// DaemonSet pods. A stalled drain (PDB) pauses for human intervention; the
-// node is never uncordoned automatically.
+// drainNode cordons the node and evicts every pod except mirror, DaemonSet
+// and protected-namespace pods (the agent's own namespace is protected, so a
+// drain can never evict the agent itself out from under its own command). A
+// stalled drain (PDB) pauses for human intervention; the node is never
+// uncordoned automatically.
 func (e *Executor) drainNode(ctx context.Context, cmd *protocol.Command, report func(*protocol.Report), log *slog.Logger) {
 	node := cmd.Target.Name
 	if node == "" {
@@ -341,11 +343,12 @@ func (e *Executor) drainNode(ctx context.Context, cmd *protocol.Command, report 
 	}
 
 	// The fake clientset ignores field selectors, so filter explicitly by
-	// node name, and skip mirror and DaemonSet-managed pods.
+	// node name, and skip mirror, DaemonSet-managed and protected-namespace
+	// pods.
 	total := 0
 	for i := range pods.Items {
 		p := &pods.Items[i]
-		if p.Spec.NodeName != node || isMirrorPod(p) || isDaemonSetPod(p) {
+		if p.Spec.NodeName != node || isMirrorPod(p) || isDaemonSetPod(p) || e.cfg.ProtectedNamespace(p.Namespace) {
 			continue
 		}
 		total++
@@ -360,7 +363,7 @@ func (e *Executor) drainNode(ctx context.Context, cmd *protocol.Command, report 
 	evicted := 0
 	for i := range pods.Items {
 		p := &pods.Items[i]
-		if p.Spec.NodeName != node || isMirrorPod(p) || isDaemonSetPod(p) {
+		if p.Spec.NodeName != node || isMirrorPod(p) || isDaemonSetPod(p) || e.cfg.ProtectedNamespace(p.Namespace) {
 			continue
 		}
 		for {

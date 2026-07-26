@@ -3,7 +3,7 @@ name: k8s-agent
 description: >-
   In-cluster agent operator for AuditReady: a read-only information gatherer
   and an optional read-write control executor, each authenticated with its own
-  projected ServiceAccount token, reporting to an external control plane.
+  ServiceAccount token, reporting to an external control plane.
 type: application
 version: 0.1.0
 appVersion: "0.1.0"
