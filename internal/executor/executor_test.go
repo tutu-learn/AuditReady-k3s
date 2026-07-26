@@ -373,6 +373,51 @@ type pdbError struct{}
 
 func (e *pdbError) Error() string { return "cannot evict pod: PDB budget exceeded" }
 
+func TestUncordonNode(t *testing.T) {
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+		Spec:       corev1.NodeSpec{Unschedulable: true},
+	}
+	kube := kubefake.NewSimpleClientset(node)
+	e := newExecutor(testConfig(), dynfake.NewSimpleDynamicClient(runtime.NewScheme()), kube)
+	rec := &recorder{}
+
+	cmd := &protocol.Command{
+		ID:     "cmd-uncordon",
+		Verb:   protocol.VerbUncordonNode,
+		Target: protocol.ResourceRef{Version: "v1", Resource: "nodes", Name: "node-1"},
+	}
+	e.HandleCommand(context.Background(), cmd, rec.report)
+
+	if got := rec.last().Status; got != protocol.StatusSucceeded {
+		t.Fatalf("last status = %q, sequence %v", got, rec.statuses())
+	}
+
+	n, err := kube.CoreV1().Nodes().Get(context.Background(), "node-1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.Spec.Unschedulable {
+		t.Fatal("node still marked unschedulable after uncordon")
+	}
+}
+
+func TestUncordonNodeRequiresName(t *testing.T) {
+	e := newExecutor(testConfig(), dynfake.NewSimpleDynamicClient(runtime.NewScheme()), kubefake.NewSimpleClientset())
+	rec := &recorder{}
+
+	cmd := &protocol.Command{
+		ID:     "cmd-uncordon-empty",
+		Verb:   protocol.VerbUncordonNode,
+		Target: protocol.ResourceRef{Version: "v1", Resource: "nodes"},
+	}
+	e.HandleCommand(context.Background(), cmd, rec.report)
+
+	if got := rec.last().Status; got != protocol.StatusFailed {
+		t.Fatalf("last status = %q, sequence %v", got, rec.statuses())
+	}
+}
+
 func TestCertRotate(t *testing.T) {
 	certsGVR := schema.GroupVersionResource{Group: "cert-manager.io", Version: "v1", Resource: "certificates"}
 	crsGVR := schema.GroupVersionResource{Group: "cert-manager.io", Version: "v1", Resource: "certificaterequests"}

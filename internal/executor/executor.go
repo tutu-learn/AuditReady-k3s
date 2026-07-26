@@ -69,6 +69,8 @@ func (e *Executor) HandleCommand(ctx context.Context, cmd *protocol.Command, rep
 		e.delete(ctx, cmd, report, log)
 	case protocol.VerbDrainNode:
 		e.drainNode(ctx, cmd, report, log)
+	case protocol.VerbUncordonNode:
+		e.uncordonNode(ctx, cmd, report, log)
 	case protocol.VerbHelmInstall:
 		e.helmInstall(ctx, cmd, report, log)
 	case protocol.VerbHelmUpgrade:
@@ -404,6 +406,28 @@ func (e *Executor) drainNode(ctx context.Context, cmd *protocol.Command, report 
 
 	metrics.ClearDrainProgress(node)
 	e.succeed(cmd, report, fmt.Sprintf("node %s drained, %d pods evicted", node, evicted))
+}
+
+// uncordonNode marks the node schedulable again. Uncordoning an
+// already-schedulable node counts as success.
+func (e *Executor) uncordonNode(ctx context.Context, cmd *protocol.Command, report func(*protocol.Report), log *slog.Logger) {
+	node := cmd.Target.Name
+	if node == "" {
+		e.fail(cmd, report, log, "uncordon-node requires a node name", fmt.Errorf("empty target name"))
+		return
+	}
+
+	if _, err := e.kube.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{}); err != nil {
+		e.fail(cmd, report, log, "cannot get node", err)
+		return
+	}
+	if _, err := e.kube.CoreV1().Nodes().Patch(ctx, node, types.MergePatchType,
+		[]byte(`{"spec":{"unschedulable":false}}`), metav1.PatchOptions{}); err != nil {
+		e.fail(cmd, report, log, "cannot uncordon node", err)
+		return
+	}
+	log.Info("node uncordoned", "node", node)
+	e.succeed(cmd, report, fmt.Sprintf("node %s uncordoned", node))
 }
 
 func isMirrorPod(p *corev1.Pod) bool {

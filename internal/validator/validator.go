@@ -40,7 +40,7 @@ func (v *Validator) Validate(cmd *protocol.Command) error {
 		// Safe default: do nothing. Upgrading the cluster from an in-cluster
 		// agent is too dangerous for this agent version.
 		return &Refusal{Reason: "cluster-upgrade is not supported by this agent version"}
-	case protocol.VerbDelete, protocol.VerbDrainNode, protocol.VerbCertRotate:
+	case protocol.VerbDelete, protocol.VerbDrainNode, protocol.VerbUncordonNode, protocol.VerbCertRotate:
 		// Structural checks below.
 	case protocol.VerbHelmInstall, protocol.VerbHelmUpgrade, protocol.VerbHelmUninstall:
 		if err := v.validateHelm(cmd); err != nil {

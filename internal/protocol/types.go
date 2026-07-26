@@ -18,6 +18,7 @@ const (
 	VerbPatch          = "patch"
 	VerbDelete         = "delete"
 	VerbDrainNode      = "drain-node"
+	VerbUncordonNode   = "uncordon-node"
 	VerbHelmInstall    = "helm-install"
 	VerbHelmUpgrade    = "helm-upgrade"
 	VerbHelmUninstall  = "helm-uninstall"

@@ -5,7 +5,7 @@ In-cluster agent for the Kubernetes management tool. One deployment per cluster.
 ## What it does
 
 - Watches every Kubernetes resource of interest via shared informers and streams changes to the server
-- Receives signed commands over a persistent WebSocket (real-time push, `WS_ENABLED` default on) with HTTP polling every `POLL_INTERVAL` (default 30s) as the fallback, and executes them: install/upgrade/uninstall Helm charts, patch resources, rotate certificates, drain nodes (`cluster-upgrade` is currently refused as unsupported — the agent errs toward doing nothing)
+- Receives signed commands over a persistent WebSocket (real-time push, `WS_ENABLED` default on) with HTTP polling every `POLL_INTERVAL` (default 30s) as the fallback, and executes them: install/upgrade/uninstall Helm charts, patch resources, rotate certificates, drain and uncordon nodes (`cluster-upgrade` is currently refused as unsupported — the agent errs toward doing nothing)
 - Re-evaluates policy locally before applying — a compromised server cannot push forbidden changes
 - Dry-runs every mutation before applying
 - Detects drift between last-known state and live state, refuses conflicting writes without an override
