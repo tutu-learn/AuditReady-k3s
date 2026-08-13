@@ -4,22 +4,30 @@
 package executor
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/restmapper"
 	"sigs.k8s.io/yaml"
 
 	"AuditReady-k3s/internal/config"
@@ -41,15 +49,25 @@ type Executor struct {
 	dyn     dynamic.Interface
 	kube    kubernetes.Interface
 	restCfg *rest.Config
+	mapper  meta.RESTMapper
 	log     *slog.Logger
 }
 
-// New returns an Executor. restCfg is used for Helm operations.
+// New returns an Executor. restCfg is used for Helm operations and to build
+// the discovery RESTMapper that apply uses to resolve payload kinds to
+// resources. Tests substitute a static mapper via the mapper field.
 func New(cfg *config.Config, dyn dynamic.Interface, kube kubernetes.Interface, restCfg *rest.Config, log *slog.Logger) *Executor {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Executor{cfg: cfg, dyn: dyn, kube: kube, restCfg: restCfg, log: log}
+	e := &Executor{cfg: cfg, dyn: dyn, kube: kube, restCfg: restCfg, log: log}
+	if dc, err := discovery.NewDiscoveryClientForConfig(restCfg); err != nil {
+		// apply falls back to the command target when no mapper is available.
+		log.Warn("discovery client unavailable, apply cannot resolve payload kinds", "error", err)
+	} else {
+		e.mapper = restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(dc))
+	}
+	return e
 }
 
 // HandleCommand executes cmd and reports every stage through report. The
@@ -137,65 +155,162 @@ func (e *Executor) checkDrift(cmd *protocol.Command, live *unstructured.Unstruct
 	}
 }
 
-// liveObject fetches the current object; nil, nil when it does not exist.
-func (e *Executor) liveObject(ctx context.Context, gvr schema.GroupVersionResource, ns, name string) (*unstructured.Unstructured, error) {
-	live, err := e.dyn.Resource(gvr).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+// liveGet fetches the current object; nil, nil when it does not exist.
+func liveGet(ctx context.Context, ri dynamic.ResourceInterface, name string) (*unstructured.Unstructured, error) {
+	live, err := ri.Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return nil, nil
 	}
 	return live, err
 }
 
-// apply decodes the payload, drift-checks the live object and
-// creates-or-updates, dry-run first when configured.
+// liveObject fetches the current object; nil, nil when it does not exist.
+func (e *Executor) liveObject(ctx context.Context, gvr schema.GroupVersionResource, ns, name string) (*unstructured.Unstructured, error) {
+	return liveGet(ctx, e.dyn.Resource(gvr).Namespace(ns), name)
+}
+
+// decodeManifest splits a possibly multi-document YAML payload into objects,
+// skipping empty documents and expanding kind: List wrappers.
+func decodeManifest(payload []byte) ([]*unstructured.Unstructured, error) {
+	var objs []*unstructured.Unstructured
+	reader := k8syaml.NewYAMLReader(bufio.NewReader(bytes.NewReader(payload)))
+	for {
+		doc, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		doc = bytes.TrimSpace(doc)
+		if len(doc) == 0 {
+			continue
+		}
+		var m map[string]interface{}
+		if err := yaml.Unmarshal(doc, &m); err != nil {
+			return nil, err
+		}
+		if len(m) == 0 {
+			continue
+		}
+		obj := &unstructured.Unstructured{Object: m}
+		if obj.GetKind() == "List" {
+			items, _, err := unstructured.NestedSlice(m, "items")
+			if err != nil {
+				return nil, fmt.Errorf("cannot read List items: %w", err)
+			}
+			for _, item := range items {
+				im, ok := item.(map[string]interface{})
+				if !ok {
+					return nil, fmt.Errorf("List item is not an object")
+				}
+				objs = append(objs, &unstructured.Unstructured{Object: im})
+			}
+			continue
+		}
+		objs = append(objs, obj)
+	}
+	return objs, nil
+}
+
+// gvrFor resolves the resource for one payload object from its own
+// apiVersion/kind via discovery, so apply works with the empty command
+// target the control plane sends for manifest deployments. Falls back to the
+// command target when the object carries no kind or discovery has no match.
+func (e *Executor) gvrFor(obj *unstructured.Unstructured, fallback protocol.ResourceRef) (gvr schema.GroupVersionResource, namespaced bool, err error) {
+	gvk := obj.GroupVersionKind()
+	if e.mapper != nil && gvk.Kind != "" {
+		mapping, merr := e.mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+		if merr == nil {
+			return mapping.Resource, mapping.Scope.Name() != meta.RESTScopeNameRoot, nil
+		}
+		if !meta.IsNoMatchError(merr) {
+			return schema.GroupVersionResource{}, false, merr
+		}
+	}
+	if fallback.Resource != "" && fallback.Version != "" {
+		// Target-specified commands predate kind resolution and address
+		// namespaced resources only.
+		return gvrOf(fallback), true, nil
+	}
+	return schema.GroupVersionResource{}, false, fmt.Errorf(
+		"cannot resolve resource type for %s %q (apiVersion %q): not in discovery and no command target",
+		gvk.Kind, obj.GetName(), gvk.GroupVersion().String())
+}
+
+// apply decodes the payload (one or more YAML documents), drift-checks each
+// live object and creates-or-updates it, dry-run first when configured. The
+// GVR comes from each object's own apiVersion/kind via discovery — apply
+// commands carry an empty target.
 func (e *Executor) apply(ctx context.Context, cmd *protocol.Command, report func(*protocol.Report), log *slog.Logger) {
-	var decoded map[string]interface{}
-	if err := yaml.Unmarshal(cmd.Payload, &decoded); err != nil {
+	objs, err := decodeManifest(cmd.Payload)
+	if err != nil {
 		e.fail(cmd, report, log, "cannot decode payload", err)
 		return
 	}
-	obj := &unstructured.Unstructured{Object: decoded}
-	if obj.GetName() == "" {
-		obj.SetName(cmd.Target.Name)
-	}
-	if obj.GetNamespace() == "" {
-		obj.SetNamespace(cmd.Target.Namespace)
-	}
-	gvr := gvrOf(cmd.Target)
-	ns, name := obj.GetNamespace(), obj.GetName()
-
-	live, err := e.liveObject(ctx, gvr, ns, name)
-	if err != nil {
-		e.fail(cmd, report, log, "cannot fetch live object", err)
-		return
-	}
-	if live != nil && !e.checkDrift(cmd, live, report, log) {
+	if len(objs) == 0 {
+		e.fail(cmd, report, log, "cannot decode payload", fmt.Errorf("payload contains no objects"))
 		return
 	}
 
-	drift.Stamp(obj)
-	ri := e.dyn.Resource(gvr).Namespace(ns)
-
-	op := "create"
-	if live != nil {
-		op = "update"
-		obj.SetResourceVersion(live.GetResourceVersion())
-	}
-
-	if e.cfg.DryRunFirst {
-		if err := e.createOrUpdate(ctx, ri, obj, op, true); err != nil {
-			e.fail(cmd, report, log, "dry-run "+op+" failed", err)
+	created, updated := 0, 0
+	for _, obj := range objs {
+		if obj.GetName() == "" {
+			obj.SetName(cmd.Target.Name)
+		}
+		if obj.GetNamespace() == "" {
+			obj.SetNamespace(cmd.Target.Namespace)
+		}
+		gvr, namespaced, err := e.gvrFor(obj, cmd.Target)
+		if err != nil {
+			e.fail(cmd, report, log, "cannot resolve resource type", err)
 			return
 		}
-		report(&protocol.Report{Status: protocol.StatusDryRun, Message: fmt.Sprintf("dry-run %s of %s %s/%s validated", op, obj.GetKind(), ns, name)})
-	}
+		ns, name := obj.GetNamespace(), obj.GetName()
+		id := fmt.Sprintf("%s %s/%s", obj.GetKind(), ns, name)
 
-	report(&protocol.Report{Status: protocol.StatusApplying, Message: op + " " + name})
-	if err := e.createOrUpdate(ctx, ri, obj, op, false); err != nil {
-		e.fail(cmd, report, log, op+" failed", err)
-		return
+		var ri dynamic.ResourceInterface = e.dyn.Resource(gvr)
+		if namespaced {
+			ri = e.dyn.Resource(gvr).Namespace(ns)
+		}
+
+		live, err := liveGet(ctx, ri, name)
+		if err != nil {
+			e.fail(cmd, report, log, "cannot fetch live "+id, err)
+			return
+		}
+		if live != nil && !e.checkDrift(cmd, live, report, log) {
+			return
+		}
+
+		drift.Stamp(obj)
+
+		op := "create"
+		if live != nil {
+			op = "update"
+			obj.SetResourceVersion(live.GetResourceVersion())
+		}
+
+		if e.cfg.DryRunFirst {
+			if err := e.createOrUpdate(ctx, ri, obj, op, true); err != nil {
+				e.fail(cmd, report, log, "dry-run "+op+" of "+id+" failed", err)
+				return
+			}
+			report(&protocol.Report{Status: protocol.StatusDryRun, Message: fmt.Sprintf("dry-run %s of %s validated", op, id)})
+		}
+
+		report(&protocol.Report{Status: protocol.StatusApplying, Message: op + " " + id})
+		if err := e.createOrUpdate(ctx, ri, obj, op, false); err != nil {
+			e.fail(cmd, report, log, op+" of "+id+" failed", err)
+			return
+		}
+		if live != nil {
+			updated++
+		} else {
+			created++
+		}
 	}
-	e.succeed(cmd, report, fmt.Sprintf("%sd %s %s/%s", op, obj.GetKind(), ns, name))
+	e.succeed(cmd, report, fmt.Sprintf("applied %d object(s): %d created, %d updated", created+updated, created, updated))
 }
 
 func (e *Executor) createOrUpdate(ctx context.Context, ri dynamic.ResourceInterface, obj *unstructured.Unstructured, op string, dryRun bool) error {

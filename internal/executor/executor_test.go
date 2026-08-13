@@ -10,6 +10,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -84,7 +85,29 @@ func applyCommand() *protocol.Command {
 }
 
 func newExecutor(cfg *config.Config, dyn *dynfake.FakeDynamicClient, kube *kubefake.Clientset) *Executor {
-	return New(cfg, dyn, kube, &rest.Config{Host: "https://127.0.0.1:6443"}, testLogger())
+	e := New(cfg, dyn, kube, &rest.Config{Host: "https://127.0.0.1:6443"}, testLogger())
+	// The deferred discovery mapper built by New would dial the fake host;
+	// substitute a static mapper for the kinds the tests use.
+	e.mapper = testRESTMapper()
+	return e
+}
+
+// testRESTMapper is a static mapper for the kinds used in tests, pluralized
+// with the standard unsafe guess (ConfigMap→configmaps, …).
+func testRESTMapper() meta.RESTMapper {
+	m := meta.NewDefaultRESTMapper(nil)
+	namespaced := []schema.GroupVersionKind{
+		{Group: "", Version: "v1", Kind: "ConfigMap"},
+		{Group: "", Version: "v1", Kind: "Secret"},
+		{Group: "", Version: "v1", Kind: "Service"},
+		{Group: "", Version: "v1", Kind: "PersistentVolumeClaim"},
+		{Group: "apps", Version: "v1", Kind: "Deployment"},
+	}
+	for _, gvk := range namespaced {
+		m.Add(gvk, meta.RESTScopeNamespace)
+	}
+	m.Add(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Namespace"}, meta.RESTScopeRoot)
+	return m
 }
 
 // honorCreateDryRun makes the fake dynamic client skip persisting dry-run
@@ -503,5 +526,135 @@ func TestUnknownVerbRefused(t *testing.T) {
 	e.HandleCommand(context.Background(), &protocol.Command{ID: "x", Verb: "self-destruct"}, rec.report)
 	if got := rec.last().Status; got != protocol.StatusRefused {
 		t.Fatalf("unknown verb must be refused, got %q", got)
+	}
+}
+
+var (
+	secretGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
+	deployGVR = schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}
+	nsGVR     = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "namespaces"}
+)
+
+// applyCommandEmptyTarget mirrors what the control plane sends for s2s
+// manifest deployments: an apply whose target is entirely empty — the
+// payload is the whole command.
+func applyCommandEmptyTarget(payload string) *protocol.Command {
+	return &protocol.Command{
+		ID:      "cmd-s2s",
+		Verb:    protocol.VerbApply,
+		Payload: []byte(payload),
+	}
+}
+
+// The payload carries two documents and the command target is empty: both
+// objects must be created, with the GVR resolved from each document's own
+// apiVersion/kind. Regression test for s2s deployments failing with
+// `cannot get resource "<namespace>" in API group ""` (the namespace value
+// landed in the resource position because the GVR came from the empty
+// target).
+func TestApplyMultiDocManifestWithEmptyTarget(t *testing.T) {
+	dyn := dynfake.NewSimpleDynamicClient(runtime.NewScheme())
+	honorCreateDryRun(dyn)
+	e := newExecutor(testConfig(), dyn, kubefake.NewSimpleClientset())
+	rec := &recorder{}
+
+	payload := `apiVersion: v1
+kind: Secret
+metadata:
+  name: pull-secret
+  namespace: apps
+type: kubernetes.io/dockerconfigjson
+data:
+  key: dmFsdWU=
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: apps
+spec:
+  replicas: 1
+`
+	e.HandleCommand(context.Background(), applyCommandEmptyTarget(payload), rec.report)
+
+	if got := rec.last().Status; got != protocol.StatusSucceeded {
+		t.Fatalf("multi-doc apply failed: %q (%s)", got, rec.last().Message)
+	}
+	if _, err := dyn.Resource(secretGVR).Namespace("apps").Get(context.Background(), "pull-secret", metav1.GetOptions{}); err != nil {
+		t.Fatalf("secret not created: %v", err)
+	}
+	if _, err := dyn.Resource(deployGVR).Namespace("apps").Get(context.Background(), "web", metav1.GetOptions{}); err != nil {
+		t.Fatalf("deployment not created: %v", err)
+	}
+	if !strings.Contains(rec.last().Message, "2 created") {
+		t.Fatalf("success message %q should report 2 created objects", rec.last().Message)
+	}
+}
+
+// Cluster-scoped kinds must be applied without a namespace.
+func TestApplyClusterScopedObject(t *testing.T) {
+	dyn := dynfake.NewSimpleDynamicClient(runtime.NewScheme())
+	honorCreateDryRun(dyn)
+	e := newExecutor(testConfig(), dyn, kubefake.NewSimpleClientset())
+	rec := &recorder{}
+
+	payload := "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: team-a\n"
+	e.HandleCommand(context.Background(), applyCommandEmptyTarget(payload), rec.report)
+
+	if got := rec.last().Status; got != protocol.StatusSucceeded {
+		t.Fatalf("cluster-scoped apply failed: %q (%s)", got, rec.last().Message)
+	}
+	if _, err := dyn.Resource(nsGVR).Get(context.Background(), "team-a", metav1.GetOptions{}); err != nil {
+		t.Fatalf("namespace not created: %v", err)
+	}
+}
+
+// A payload kind unknown to discovery with an empty target must fail with a
+// clear message instead of hitting the API server with an empty resource.
+func TestApplyUnknownKindWithEmptyTargetFails(t *testing.T) {
+	e := newExecutor(testConfig(), dynfake.NewSimpleDynamicClient(runtime.NewScheme()), kubefake.NewSimpleClientset())
+	rec := &recorder{}
+
+	payload := "apiVersion: example.io/v1\nkind: Bogus\nmetadata:\n  name: x\n  namespace: default\n"
+	e.HandleCommand(context.Background(), applyCommandEmptyTarget(payload), rec.report)
+
+	if got := rec.last().Status; got != protocol.StatusFailed {
+		t.Fatalf("unknown kind must fail, got %q", got)
+	}
+	if !strings.Contains(rec.last().Message, "cannot resolve resource type") {
+		t.Fatalf("unexpected failure message: %q", rec.last().Message)
+	}
+}
+
+// A kind: List payload is expanded and every item applied.
+func TestApplyKindList(t *testing.T) {
+	dyn := dynfake.NewSimpleDynamicClient(runtime.NewScheme())
+	honorCreateDryRun(dyn)
+	e := newExecutor(testConfig(), dyn, kubefake.NewSimpleClientset())
+	rec := &recorder{}
+
+	payload := `apiVersion: v1
+kind: List
+items:
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: one
+    namespace: default
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: two
+    namespace: default
+`
+	e.HandleCommand(context.Background(), applyCommandEmptyTarget(payload), rec.report)
+
+	if got := rec.last().Status; got != protocol.StatusSucceeded {
+		t.Fatalf("List apply failed: %q (%s)", got, rec.last().Message)
+	}
+	for _, name := range []string{"one", "two"} {
+		if _, err := dyn.Resource(cmGVR).Namespace("default").Get(context.Background(), name, metav1.GetOptions{}); err != nil {
+			t.Fatalf("configmap %s not created: %v", name, err)
+		}
 	}
 }
