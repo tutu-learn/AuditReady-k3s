@@ -45,7 +45,7 @@ The operator is one binary but runs as two logically separate subsystems, each w
                   RBAC decides per call
 ```
 
-Two ServiceAccounts, two token files (`/var/run/secrets/agent-reader`, `/var/run/secrets/agent-writer`), two ClusterRoleBindings. The reader token is a projected serviceAccountToken volume; the writer token comes from a classic token Secret because projections can only mint tokens for the pod's own SA. The read path holds only a read-only dynamic client and physically cannot mutate the cluster. Neither account gets `cluster-admin`. If the writer token is absent the process forces read-only mode.
+Two ServiceAccounts, two token files (`/var/run/secrets/agent-reader`, `/var/run/secrets/agent-writer`), two ClusterRoleBindings. The reader token is a projected serviceAccountToken volume; the writer token comes from a classic token Secret because projections can only mint tokens for the pod's own SA. The read path holds only a read-only dynamic client and physically cannot mutate the cluster. The writer is bound cluster-wide to the built-in `admin` ClusterRole (all namespaced resources, every namespace) plus namespace read; neither account gets `cluster-admin`. If the writer token is absent the process forces read-only mode.
 
 ## Requirements
 
@@ -104,6 +104,19 @@ kubectl -n k8s-agent-system logs -l app=k8s-agent
 
 The cluster appears in the control plane UI within a minute of first sync.
 
+## Upgrade to latest
+
+```bash
+helm upgrade k8s-agent oci://ghcr.io/tutu-learn/charts/k8s-agent -n k8s-agent-system --reuse-values
+```
+
+Omitting `--version` pulls the newest published chart build, which also pins
+the matching new image via `appVersion`. Watch the rollout with:
+
+```bash
+kubectl rollout status deployment/k8s-agent -n k8s-agent-system
+```
+
 ## Uninstall
 
 ```bash
@@ -132,20 +145,9 @@ The Helm chart creates two ServiceAccounts.
 
 **`agent-reader`** — bound to a ClusterRole granting `get`, `list`, `watch` on all watched kinds. Read only.
 
-**`agent-writer`** — bound to a ClusterRole granting scoped write verbs:
+**`agent-writer`** — bound cluster-wide to the built-in `admin` ClusterRole, granting full `create`, `update`, `patch`, `delete` (and read) on all namespaced resources in every namespace, including Roles/RoleBindings inside namespaces. A second ClusterRoleBinding adds `get`, `list`, `watch` on Namespaces, which the operator needs to validate deploy targets.
 
-| Resource | Verbs |
-|---|---|
-| Deployments, StatefulSets, DaemonSets | get, list, watch, create, update, patch, delete |
-| Services, Ingresses, ConfigMaps | get, list, watch, create, update, patch, delete |
-| Secrets | get, list, watch, create, update, patch, delete |
-| Pods | get, list, watch, delete |
-| Pods/eviction | create |
-| Nodes | get, list, watch, patch |
-| Certificates (cert-manager) | get, list, watch, create, update, patch, delete |
-| Role, RoleBinding, ClusterRole, ClusterRoleBinding | get, list, watch, create, update, patch, delete |
-
-**Never granted:** wildcard verbs on `*/*`, `impersonate`, `escalate`, `bind` on ClusterRoles.
+**Not granted:** cluster-scoped writes — the writer cannot create or modify CRDs, ClusterRoles/ClusterRoleBindings, Nodes, or Namespaces themselves, and gets no `impersonate` / `escalate` / `bind` verbs on cluster-level RBAC. Treat the writer token as a high-value credential regardless: cluster-wide `admin` can read every Secret in the cluster.
 
 Review the exact grants before installing: `helm template ... | grep -A5 rules`.
 

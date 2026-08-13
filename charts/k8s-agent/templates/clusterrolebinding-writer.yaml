@@ -13,4 +13,22 @@ subjects:
   - kind: ServiceAccount
     name: agent-writer
     namespace: {{ .Release.Namespace }}
+---
+# Full create/update/delete on namespaced resources in every namespace,
+# via the built-in "admin" ClusterRole. This does not cover cluster-scoped
+# objects (CRDs, nodes, namespaces themselves).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-agent-writer-admin
+  labels:
+    {{- include "k8s-agent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: admin
+subjects:
+  - kind: ServiceAccount
+    name: agent-writer
+    namespace: {{ .Release.Namespace }}
 {{- end }}

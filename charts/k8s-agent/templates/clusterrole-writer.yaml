@@ -1,4 +1,9 @@
 {{- if .Values.writer.enabled }}
+# Namespace read access for the writer. Workload management is granted
+# cluster-wide via the built-in "admin" ClusterRole (see
+# clusterrolebinding-writer.yaml); this role only adds what "admin" does
+# not cover: reading Namespace objects themselves, which the operator
+# needs to validate deploy targets.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -6,36 +11,7 @@ metadata:
   labels:
     {{- include "k8s-agent.labels" . | nindent 4 }}
 rules:
-  # Deliberately scoped: no wildcard verbs/resources, and no
-  # impersonate / escalate / bind anywhere.
-  - apiGroups: ["apps"]
-    resources: ["deployments", "statefulsets", "daemonsets"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: [""]
-    resources: ["services", "configmaps"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["get", "list", "watch", "delete"]
-  - apiGroups: [""]
-    resources: ["pods/eviction"]
-    verbs: ["create"]
-  - apiGroups: [""]
-    resources: ["nodes"]
-    verbs: ["get", "list", "watch", "patch"]
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["ingresses"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["cert-manager.io"]
-    resources: ["certificates"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["rbac.authorization.k8s.io"]
-    resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 {{- end }}
