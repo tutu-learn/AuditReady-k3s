@@ -18,6 +18,10 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
         prometheus.io/path: "/metrics"
+        # Roll the pods on every chart upgrade, even when image.tag is a
+        # mutable tag (e.g. "latest") that would otherwise render an
+        # identical pod spec and leave the old binary running.
+        sebrus.dev/chart-version: {{ .Chart.Version | quote }}
     spec:
       # The pod's own (default) token is the least-privileged reader SA, and
       # default token automount is disabled: the reader token is wired in via
@@ -31,7 +35,10 @@ spec:
       containers:
         - name: operator
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Default policy depends on the effective tag: a mutable "latest"
+          # must always re-pull or a rolled pod silently keeps the node's
+          # cached old image; pinned tags are fine with IfNotPresent.
+          imagePullPolicy: {{ .Values.image.pullPolicy | default (ternary "Always" "IfNotPresent" (eq (.Values.image.tag | default .Chart.AppVersion) "latest")) }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           env:

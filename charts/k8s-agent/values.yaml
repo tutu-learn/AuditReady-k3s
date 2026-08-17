@@ -4,7 +4,8 @@ image:
   repository: ghcr.io/tutu-learn/k8s-agent-operator
   # tag defaults to .Chart.AppVersion when empty
   tag: ""
-  pullPolicy: IfNotPresent
+  # empty = Always for the mutable "latest" tag, IfNotPresent otherwise
+  pullPolicy: ""
 
 server:
   endpoint: ""   # required, e.g. https://control-plane.your-org.example/audit_ready
