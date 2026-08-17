@@ -106,16 +106,19 @@ The cluster appears in the control plane UI within a minute of first sync.
 
 ## Upgrade to latest
 
-```bash
-helm upgrade k8s-agent oci://ghcr.io/tutu-learn/charts/k8s-agent -n k8s-agent-system --reuse-values
-```
-
-Omitting `--version` pulls the newest published chart build, which also pins
-the matching new image via `appVersion`. Watch the rollout with:
+Copy and paste this into a shell with cluster access to update the agent to the
+newest published build and wait for the rollout to finish:
 
 ```bash
+helm upgrade k8s-agent oci://ghcr.io/tutu-learn/charts/k8s-agent \
+  -n k8s-agent-system --reuse-values && \
 kubectl rollout status deployment/k8s-agent -n k8s-agent-system
 ```
+
+`--reuse-values` keeps your existing endpoint, token, and other settings, so
+nothing from the original install needs to be re-entered. Omitting `--version`
+pulls the newest published chart build, which also pins the matching new image
+via `appVersion`.
 
 ## Uninstall
 
