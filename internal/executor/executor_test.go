@@ -27,6 +27,8 @@ import (
 )
 
 var cmGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"}
+var pvcGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "persistentvolumeclaims"}
+var svcGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "services"}
 
 func testConfig() *config.Config {
 	return &config.Config{
@@ -656,5 +658,141 @@ items:
 		if _, err := dyn.Resource(cmGVR).Namespace("default").Get(context.Background(), name, metav1.GetOptions{}); err != nil {
 			t.Fatalf("configmap %s not created: %v", name, err)
 		}
+	}
+}
+
+// Applying over an already-bound PVC must adopt the volume binding and
+// clamp the request up to the live capacity — the exact failure a blind
+// full replace produced on redeploy.
+func TestApplyUpdatesExistingPVC(t *testing.T) {
+	live := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "PersistentVolumeClaim",
+		"metadata":   map[string]interface{}{"name": "data", "namespace": "default", "resourceVersion": "7"},
+		"spec": map[string]interface{}{
+			"storageClassName": "hcloud-volumes",
+			"volumeName":       "pvc-123",
+			"accessModes":      []interface{}{"ReadWriteOnce"},
+			"resources": map[string]interface{}{
+				"requests": map[string]interface{}{"storage": "10Gi"},
+			},
+		},
+		"status": map[string]interface{}{
+			"capacity": map[string]interface{}{"storage": "20Gi"},
+		},
+	}}
+	dyn := dynfake.NewSimpleDynamicClient(runtime.NewScheme(), live)
+	e := newExecutor(testConfig(), dyn, kubefake.NewSimpleClientset())
+	rec := &recorder{}
+
+	payload := `apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+  namespace: default
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+`
+	e.HandleCommand(context.Background(), applyCommandEmptyTarget(payload), rec.report)
+
+	if got := rec.last().Status; got != protocol.StatusSucceeded {
+		t.Fatalf("apply over bound PVC failed: %q (%s)", got, rec.last().Message)
+	}
+	if !strings.Contains(rec.last().Message, "1 updated") {
+		t.Fatalf("expected an update, got %q", rec.last().Message)
+	}
+	got, err := dyn.Resource(pvcGVR).Namespace("default").Get(context.Background(), "data", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("cannot fetch pvc: %v", err)
+	}
+	if v, _, _ := unstructured.NestedString(got.Object, "spec", "volumeName"); v != "pvc-123" {
+		t.Fatalf("volumeName not adopted from live: %q", v)
+	}
+	if v, _, _ := unstructured.NestedString(got.Object, "spec", "storageClassName"); v != "hcloud-volumes" {
+		t.Fatalf("storageClassName not adopted from live: %q", v)
+	}
+	if v, _, _ := unstructured.NestedString(got.Object, "spec", "resources", "requests", "storage"); v != "20Gi" {
+		t.Fatalf("storage request not clamped to live capacity: %q", v)
+	}
+}
+
+// An update keeps live state the manifest does not mention: labels, extra
+// data keys and server-set fields survive a redeploy.
+func TestApplyUpdatePreservesUnspecifiedLiveFields(t *testing.T) {
+	live := liveCM("old")
+	live.Object["data"] = map[string]interface{}{"key": "old", "extra": "keep"}
+	live.SetLabels(map[string]string{"deployed-by": "agent"})
+	dyn := dynfake.NewSimpleDynamicClient(runtime.NewScheme(), live)
+	e := newExecutor(testConfig(), dyn, kubefake.NewSimpleClientset())
+	rec := &recorder{}
+
+	e.HandleCommand(context.Background(), applyCommand(), rec.report)
+
+	if got := rec.last().Status; got != protocol.StatusSucceeded {
+		t.Fatalf("update failed: %q (%s)", got, rec.last().Message)
+	}
+	if !strings.Contains(rec.last().Message, "1 updated") {
+		t.Fatalf("expected an update, got %q", rec.last().Message)
+	}
+	got, err := dyn.Resource(cmGVR).Namespace("default").Get(context.Background(), "cm", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("cannot fetch configmap: %v", err)
+	}
+	data, _, _ := unstructured.NestedStringMap(got.Object, "data")
+	if data["key"] != "desired" {
+		t.Fatalf("manifest field not applied: data.key = %q", data["key"])
+	}
+	if data["extra"] != "keep" {
+		t.Fatalf("live-only field lost: data.extra = %q", data["extra"])
+	}
+	if got.GetLabels()["deployed-by"] != "agent" {
+		t.Fatal("live-only label lost")
+	}
+}
+
+// Applying over an existing Service adopts the allocated clusterIP fields.
+func TestApplyUpdateAdoptsServiceClusterIP(t *testing.T) {
+	live := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Service",
+		"metadata":   map[string]interface{}{"name": "web", "namespace": "default", "resourceVersion": "3"},
+		"spec": map[string]interface{}{
+			"clusterIP":      "10.0.0.5",
+			"clusterIPs":     []interface{}{"10.0.0.5"},
+			"ipFamilies":     []interface{}{"IPv4"},
+			"ipFamilyPolicy": "SingleStack",
+			"ports": []interface{}{map[string]interface{}{
+				"port": int64(80), "targetPort": int64(8080),
+			}},
+		},
+	}}
+	dyn := dynfake.NewSimpleDynamicClient(runtime.NewScheme(), live)
+	e := newExecutor(testConfig(), dyn, kubefake.NewSimpleClientset())
+	rec := &recorder{}
+
+	payload := `apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: default
+spec:
+  ports:
+  - port: 80
+    targetPort: 8080
+`
+	e.HandleCommand(context.Background(), applyCommandEmptyTarget(payload), rec.report)
+
+	if got := rec.last().Status; got != protocol.StatusSucceeded {
+		t.Fatalf("apply over existing Service failed: %q (%s)", got, rec.last().Message)
+	}
+	got, err := dyn.Resource(svcGVR).Namespace("default").Get(context.Background(), "web", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("cannot fetch service: %v", err)
+	}
+	if v, _, _ := unstructured.NestedString(got.Object, "spec", "clusterIP"); v != "10.0.0.5" {
+		t.Fatalf("clusterIP not adopted from live: %q", v)
 	}
 }

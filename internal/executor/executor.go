@@ -17,6 +17,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -241,7 +242,10 @@ func (e *Executor) gvrFor(obj *unstructured.Unstructured, fallback protocol.Reso
 // apply decodes the payload (one or more YAML documents), drift-checks each
 // live object and creates-or-updates it, dry-run first when configured. The
 // GVR comes from each object's own apiVersion/kind via discovery — apply
-// commands carry an empty target.
+// commands carry an empty target. An object that already exists is updated
+// in place: the manifest is overlaid on the live state and immutable fields
+// are adopted from live, so redeploying over an existing deployment adapts
+// to it instead of failing.
 func (e *Executor) apply(ctx context.Context, cmd *protocol.Command, report func(*protocol.Report), log *slog.Logger) {
 	objs, err := decodeManifest(cmd.Payload)
 	if err != nil {
@@ -283,13 +287,20 @@ func (e *Executor) apply(ctx context.Context, cmd *protocol.Command, report func
 			return
 		}
 
-		drift.Stamp(obj)
-
 		op := "create"
 		if live != nil {
 			op = "update"
+			// Update-in-place: overlay the manifest on the live object so
+			// anything the manifest omits — a bound PVC's volumeName, an
+			// assigned clusterIP — survives, and adopt fields the API
+			// server treats as immutable so the update validates instead
+			// of failing on a resource that is already there.
+			obj = mergeForUpdate(live, obj)
 			obj.SetResourceVersion(live.GetResourceVersion())
+			adoptImmutableFields(obj, live, log)
 		}
+
+		drift.Stamp(obj)
 
 		if e.cfg.DryRunFirst {
 			if err := e.createOrUpdate(ctx, ri, obj, op, true); err != nil {
@@ -324,6 +335,126 @@ func (e *Executor) createOrUpdate(ctx context.Context, ri dynamic.ResourceInterf
 	}
 	_, err := ri.Update(ctx, obj, metav1.UpdateOptions{DryRun: dry})
 	return err
+}
+
+// mergeForUpdate builds the update body for an existing object: a copy of
+// the live object with the desired manifest overlaid. Fields the manifest
+// sets are updated; everything the manifest omits — including server-set
+// state like a bound PVC's volumeName — is kept from live, so updating an
+// already-deployed resource never tries to clear what is already there.
+func mergeForUpdate(live, desired *unstructured.Unstructured) *unstructured.Unstructured {
+	merged := live.DeepCopy()
+	merged.Object = mergeMap(merged.Object, desired.Object)
+	return merged
+}
+
+// mergeMap overlays override onto base: nested maps merge recursively, any
+// other override value wins, and an explicit null removes the key.
+func mergeMap(base, override map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(base)+len(override))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range override {
+		if v == nil {
+			delete(out, k)
+			continue
+		}
+		if ov, ok := v.(map[string]interface{}); ok {
+			if bv, ok := out[k].(map[string]interface{}); ok {
+				out[k] = mergeMap(bv, ov)
+				continue
+			}
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// adoptImmutableFields restores spec fields the API server treats as
+// immutable or grow-only from the live object, so an update of an existing
+// deployment validates instead of failing on fields a manifest may not
+// legally change.
+func adoptImmutableFields(merged, live *unstructured.Unstructured, log *slog.Logger) {
+	spec, ok := merged.Object["spec"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	liveSpec, ok := live.Object["spec"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	switch merged.GetKind() {
+	case "PersistentVolumeClaim":
+		for _, f := range []string{"volumeName", "storageClassName", "volumeMode", "dataSource", "dataSourceRef", "selector"} {
+			if v, ok := liveSpec[f]; ok {
+				spec[f] = v
+			} else {
+				delete(spec, f)
+			}
+		}
+		clampPVCStorage(merged, live, log)
+	case "Service":
+		for _, f := range []string{"clusterIP", "clusterIPs", "ipFamilies", "ipFamilyPolicy"} {
+			if v, ok := liveSpec[f]; ok {
+				spec[f] = v
+			} else {
+				delete(spec, f)
+			}
+		}
+	}
+}
+
+// clampPVCStorage raises the merged storage request to at least the live
+// request and at least the live status.capacity: PVCs grow, they never
+// shrink, and the API server rejects an update whose request is below
+// either bound.
+func clampPVCStorage(merged, live *unstructured.Unstructured, log *slog.Logger) {
+	floor, ok := pvcStorageFloor(live)
+	if !ok {
+		return
+	}
+	reqStr, _, _ := unstructured.NestedString(merged.Object, "spec", "resources", "requests", "storage")
+	reqQty, err := resource.ParseQuantity(reqStr)
+	if err == nil && reqQty.Cmp(floor.qty) >= 0 {
+		return
+	}
+	if err := unstructured.SetNestedField(merged.Object, floor.str, "spec", "resources", "requests", "storage"); err != nil {
+		return
+	}
+	log.Warn("PVC storage request below live volume size, clamped up",
+		"pvc", fmt.Sprintf("%s/%s", merged.GetNamespace(), merged.GetName()),
+		"requested", reqStr, "clampedTo", floor.str)
+}
+
+// storageFloor is a quantity together with its original string form.
+type storageFloor struct {
+	qty resource.Quantity
+	str string
+}
+
+// pvcStorageFloor returns the larger of the live claim's request and its
+// status.capacity.
+func pvcStorageFloor(live *unstructured.Unstructured) (storageFloor, bool) {
+	var floor storageFloor
+	found := false
+	for _, path := range [][]string{
+		{"spec", "resources", "requests", "storage"},
+		{"status", "capacity", "storage"},
+	} {
+		s, ok, _ := unstructured.NestedString(live.Object, path...)
+		if !ok || s == "" {
+			continue
+		}
+		q, err := resource.ParseQuantity(s)
+		if err != nil {
+			continue
+		}
+		if !found || q.Cmp(floor.qty) > 0 {
+			floor.qty, floor.str, found = q, s, true
+		}
+	}
+	return floor, found
 }
 
 // patch applies a strategic/merge/json patch to the target, dry-run first
