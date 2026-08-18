@@ -402,7 +402,37 @@ func adoptImmutableFields(merged, live *unstructured.Unstructured, log *slog.Log
 				delete(spec, f)
 			}
 		}
+	case "Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job":
+		// spec.selector is immutable: adopt it from live, then make the pod
+		// template labels satisfy it — a template that no longer matches its
+		// selector is rejected, and the template's values for selector keys
+		// are just as immutable as the selector itself.
+		if v, ok := liveSpec["selector"]; ok {
+			spec["selector"] = v
+		} else {
+			delete(spec, "selector")
+		}
+		reconcileSelectorLabels(merged)
 	}
+}
+
+// reconcileSelectorLabels forces a workload's pod template labels to agree
+// with its (immutable) selector: every matchLabels entry must appear in
+// spec.template.metadata.labels with the same value, or the API server
+// rejects the update.
+func reconcileSelectorLabels(obj *unstructured.Unstructured) {
+	selector, _, _ := unstructured.NestedStringMap(obj.Object, "spec", "selector", "matchLabels")
+	if len(selector) == 0 {
+		return
+	}
+	labels, _, _ := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "labels")
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	for k, v := range selector {
+		labels[k] = v
+	}
+	_ = unstructured.SetNestedStringMap(obj.Object, labels, "spec", "template", "metadata", "labels")
 }
 
 // clampPVCStorage raises the merged storage request to at least the live

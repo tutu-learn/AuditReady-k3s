@@ -719,6 +719,68 @@ spec:
 	}
 }
 
+// Applying over an existing Deployment whose manifest carries a changed
+// selector must adopt the live (immutable) selector and reconcile the pod
+// template labels with it, instead of failing on "field is immutable".
+func TestApplyUpdateAdoptsDeploymentSelector(t *testing.T) {
+	live := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+		"metadata":   map[string]interface{}{"name": "logger", "namespace": "default", "resourceVersion": "7"},
+		"spec": map[string]interface{}{
+			"selector": map[string]interface{}{
+				"matchLabels": map[string]interface{}{"app": "logger"},
+			},
+			"template": map[string]interface{}{
+				"metadata": map[string]interface{}{
+					"labels": map[string]interface{}{"app": "logger"},
+				},
+			},
+		},
+	}}
+	dyn := dynfake.NewSimpleDynamicClient(runtime.NewScheme(), live)
+	e := newExecutor(testConfig(), dyn, kubefake.NewSimpleClientset())
+	rec := &recorder{}
+
+	payload := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logger
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: logger
+      Octopus.Kubernetes.DeploymentName: logger
+  template:
+    metadata:
+      labels:
+        app: logger
+        Octopus.Kubernetes.DeploymentName: logger
+        version: "2"
+`
+	e.HandleCommand(context.Background(), applyCommandEmptyTarget(payload), rec.report)
+
+	if got := rec.last().Status; got != protocol.StatusSucceeded {
+		t.Fatalf("apply over existing Deployment failed: %q (%s)", got, rec.last().Message)
+	}
+	got, err := dyn.Resource(deployGVR).Namespace("default").Get(context.Background(), "logger", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("cannot fetch deployment: %v", err)
+	}
+	selector, _, _ := unstructured.NestedStringMap(got.Object, "spec", "selector", "matchLabels")
+	if len(selector) != 1 || selector["app"] != "logger" {
+		t.Fatalf("selector not adopted from live: %v", selector)
+	}
+	labels, _, _ := unstructured.NestedStringMap(got.Object, "spec", "template", "metadata", "labels")
+	if labels["app"] != "logger" {
+		t.Fatalf("template label for selector key lost: %v", labels)
+	}
+	if labels["version"] != "2" {
+		t.Fatalf("manifest template label not applied: %v", labels)
+	}
+}
+
 // An update keeps live state the manifest does not mention: labels, extra
 // data keys and server-set fields survive a redeploy.
 func TestApplyUpdatePreservesUnspecifiedLiveFields(t *testing.T) {
