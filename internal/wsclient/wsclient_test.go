@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -282,5 +283,62 @@ func TestSendReportNotConnected(t *testing.T) {
 	c := New(cfg, testLogger())
 	if err := c.SendReport(context.Background(), &protocol.Report{CommandID: "x"}); err == nil {
 		t.Fatal("SendReport on a dead connection returned nil error, want failure")
+	}
+}
+
+// newSilentWSServer accepts the upgrade and then never reads, so client
+// pings go unanswered — a stand-in for a half-open connection.
+func newSilentWSServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func dialRaw(t *testing.T, ts *httptest.Server) *websocket.Conn {
+	t.Helper()
+	conn, _, err := websocket.Dial(context.Background(), "ws://"+strings.TrimPrefix(ts.URL, "http://"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	return conn
+}
+
+func TestKeepaliveClosesConnectionWhenPingsGoUnanswered(t *testing.T) {
+	conn := dialRaw(t, newSilentWSServer(t))
+
+	var activity atomic.Int64
+	activity.Store(time.Now().UnixNano())
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go keepalive(ctx, testLogger(), conn, &activity, 10*time.Millisecond, 30*time.Millisecond, time.Hour)
+
+	// The server never answers pings; after pongWithin the keepalive gives
+	// up and closes the connection, unblocking the reader.
+	if _, _, err := conn.Read(ctx); err == nil {
+		t.Fatal("read on an unanswered connection returned nil error, want the keepalive to kill it")
+	}
+}
+
+func TestKeepaliveClosesConnectionAfterSilenceTimeout(t *testing.T) {
+	conn := dialRaw(t, newSilentWSServer(t))
+
+	var activity atomic.Int64
+	activity.Store(time.Now().Add(-time.Hour).UnixNano()) // already silent
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go keepalive(ctx, testLogger(), conn, &activity, 10*time.Millisecond, time.Hour, 50*time.Millisecond)
+
+	// No inbound activity for longer than silenceAfter: the keepalive closes
+	// the connection instead of pinging a dead socket.
+	if _, _, err := conn.Read(ctx); err == nil {
+		t.Fatal("read on a silent connection returned nil error, want the keepalive to kill it")
 	}
 }

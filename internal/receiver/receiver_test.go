@@ -19,7 +19,8 @@ import (
 )
 
 // fakePoll records every PollRequest and replays scripted results; once the
-// script is exhausted it returns an empty response.
+// script is exhausted it returns an empty ok response (mirroring the real
+// server, which always answers a successful poll with ok:true).
 type fakePoll struct {
 	mu       sync.Mutex
 	requests []*protocol.PollRequest
@@ -40,7 +41,7 @@ func (f *fakePoll) poll(_ context.Context, req *protocol.PollRequest) (*protocol
 		f.script = f.script[1:]
 		return r.resp, r.err
 	}
-	return &protocol.PollResponse{}, nil
+	return &protocol.PollResponse{OK: true}, nil
 }
 
 func (f *fakePoll) numRequests() int {
@@ -255,6 +256,40 @@ func TestPollErrorRetainsReports(t *testing.T) {
 	// After poll 3 succeeds, the report is cleared.
 	waitFor(t, "report cleared", func() bool {
 		return f.poll.numRequests() >= 4 && reportIn(f.poll.request(3), "cmd-e") == nil
+	})
+}
+
+func TestPollNotOKRetainsReports(t *testing.T) {
+	f := newFixture(t, true)
+	f.poll.script = []pollResult{
+		{resp: &protocol.PollResponse{OK: true, Commands: []*protocol.Command{f.signedCommand("cmd-nok", "nonce-nok")}}},
+		{resp: &protocol.PollResponse{OK: false}}, // 200 but not ok: must not clear
+	}
+	logs := &logCapture{}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go New(f.cfg, f.poll.poll, f.h, slog.New(logs), nil).Run(ctx)
+
+	select {
+	case <-f.h.calls:
+	case <-time.After(10 * time.Second):
+		t.Fatal("handler not invoked")
+	}
+
+	// Poll 2 carries the queued received report but answers ok:false, so the
+	// report must survive and be resent on poll 3.
+	waitFor(t, "third poll", func() bool { return f.poll.numRequests() >= 3 })
+	for i := 1; i < 3; i++ {
+		if rep := reportIn(f.poll.request(i), "cmd-nok"); rep == nil {
+			t.Fatalf("poll %d lost the report for cmd-nok after an ok:false response", i+1)
+		}
+	}
+	if n := logs.count("poll response not ok"); n != 1 {
+		t.Fatalf("ok:false logged %d times, want once", n)
+	}
+	// Poll 3 answers ok, so the report is cleared afterwards.
+	waitFor(t, "report cleared", func() bool {
+		return f.poll.numRequests() >= 4 && reportIn(f.poll.request(3), "cmd-nok") == nil
 	})
 }
 

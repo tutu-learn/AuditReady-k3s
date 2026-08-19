@@ -35,6 +35,12 @@ const (
 	// pingInterval is the keepalive cadence; the library answers server
 	// pings automatically.
 	pingInterval = 25 * time.Second
+	// pongTimeout bounds one ping round trip; a ping with no pong within
+	// this window means the socket is dead.
+	pongTimeout = 30 * time.Second
+	// silenceTimeout without any inbound activity marks the connection
+	// dead (SERVER.md: treat ~60 s of silence as dead).
+	silenceTimeout = 60 * time.Second
 	// agentVersion is reported in WsHello.Version.
 	agentVersion = "dev"
 )
@@ -213,13 +219,16 @@ func (c *Client) handshake(ctx context.Context, conn *websocket.Conn) error {
 func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn) error {
 	kctx, stopKeepalive := context.WithCancel(ctx)
 	defer stopKeepalive()
-	go keepalive(kctx, conn)
+	var lastActivity atomic.Int64 // UnixNano of the last inbound frame or pong
+	lastActivity.Store(time.Now().UnixNano())
+	go keepalive(kctx, c.log, conn, &lastActivity, pingInterval, pongTimeout, silenceTimeout)
 
 	for {
 		typ, data, err := conn.Read(ctx)
 		if err != nil {
 			return fmt.Errorf("read: %w", err)
 		}
+		lastActivity.Store(time.Now().UnixNano())
 		if typ != websocket.MessageText {
 			c.log.Debug("dropping non-text frame", "type", typ)
 			continue
@@ -255,20 +264,39 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn) error {
 	}
 }
 
-// keepalive sends a protocol-level ping every pingInterval. A failed ping
-// closes the connection to unblock the reader.
-func keepalive(ctx context.Context, conn *websocket.Conn) {
-	ticker := time.NewTicker(pingInterval)
+// keepalive sends a protocol-level ping every pingEvery and closes conn when
+// the socket looks dead, so the read loop returns and the client reconnects.
+// coder/websocket matches pongs internally (it exposes no control-frame
+// handlers), so inbound activity is tracked by the read loop for data frames
+// and by each successful ping — Ping blocks until its pong is read — for
+// control traffic. silenceAfter without any activity marks the connection
+// dead; a ping is given up after pongWithin so a half-open socket cannot
+// stall this loop.
+func keepalive(ctx context.Context, log *slog.Logger, conn *websocket.Conn, lastActivity *atomic.Int64, pingEvery, pongWithin, silenceAfter time.Duration) {
+	ticker := time.NewTicker(pingEvery)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := conn.Ping(ctx); err != nil {
-				_ = conn.Close(websocket.StatusInternalError, "ping failed")
+			if idle := time.Since(time.Unix(0, lastActivity.Load())); idle > silenceAfter {
+				log.Warn("websocket silent too long, treating connection as dead",
+					"idle", idle.Round(time.Second), "limit", silenceAfter)
+				// CloseNow: the socket is presumed dead, so the graceful
+				// close handshake would only stall the reconnect by seconds.
+				conn.CloseNow()
 				return
 			}
+			pctx, cancel := context.WithTimeout(ctx, pongWithin)
+			err := conn.Ping(pctx)
+			cancel()
+			if err != nil {
+				conn.CloseNow()
+				return
+			}
+			// The pong came back: the socket is alive in both directions.
+			lastActivity.Store(time.Now().UnixNano())
 		}
 	}
 }

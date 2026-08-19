@@ -187,3 +187,35 @@ func (f *fakePoll) scriptAdd(results ...pollResult) {
 	defer f.mu.Unlock()
 	f.script = append(f.script, results...)
 }
+
+func TestTerminalReportFlushedViaPollAfterSuccessfulWSSend(t *testing.T) {
+	f := newFixture(t, true)
+	push := &fakePush{connected: true}
+	h := &reportingHandler{calls: make(chan *protocol.Command, 16)}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go New(f.cfg, f.poll.poll, h, testLogger(), push).Run(ctx)
+
+	push.push(f.signedCommand("cmd-term", "nonce-term"))
+
+	select {
+	case <-h.calls:
+	case <-time.After(10 * time.Second):
+		t.Fatal("handler not invoked")
+	}
+
+	// The succeeded report goes over the fast path...
+	waitFor(t, "succeeded report over ws", func() bool {
+		return push.findReport("cmd-term", protocol.StatusSucceeded) != nil
+	})
+	// ...but is also queued and piggybacked on a poll, so a lost WS write
+	// cannot leave the server stuck at a non-terminal status.
+	waitFor(t, "succeeded report piggybacked on poll", func() bool {
+		return f.poll.findReport("cmd-term", protocol.StatusSucceeded) != nil
+	})
+	// Non-terminal reports keep their at-most-once behavior: the received
+	// report went over the WS only and must not be duplicated onto a poll.
+	if rep := f.poll.findReport("cmd-term", protocol.StatusReceived); rep != nil {
+		t.Fatalf("non-terminal report %+v duplicated onto the poll queue", rep)
+	}
+}

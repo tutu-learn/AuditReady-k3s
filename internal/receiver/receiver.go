@@ -4,7 +4,9 @@
 // fast path (see internal/wsclient); both paths share the same validation
 // pipeline and are deduplicated by command ID. Execution reports go over the
 // WebSocket when it is connected, and are otherwise queued locally and
-// piggybacked on the next successful poll.
+// piggybacked on the next successful poll. Terminal reports (succeeded,
+// failed, refused) are always queued as well, so a report lost on a dying
+// socket is still flushed via poll.
 package receiver
 
 import (
@@ -47,7 +49,8 @@ const (
 
 // Handler executes a validated command and reports progress via report.
 // Reports are streamed over the WebSocket fast path when it is connected and
-// queued for the next successful poll otherwise.
+// queued for the next successful poll otherwise; terminal reports are queued
+// even when the fast path accepts them.
 type Handler interface {
 	HandleCommand(ctx context.Context, cmd *protocol.Command, report func(*protocol.Report))
 }
@@ -138,7 +141,13 @@ func (r *Receiver) Run(ctx context.Context) {
 			continue
 		}
 		bo.reset()
-		r.queue.clearSent(req.Reports)
+		// A 200 with ok:false means the server did not accept the request;
+		// keep the reports queued so they are retried on the next poll.
+		if resp.OK {
+			r.queue.clearSent(req.Reports)
+		} else {
+			r.log.Warn("poll response not ok, keeping queued reports", "queuedReports", len(req.Reports))
+		}
 		for _, cmd := range resp.Commands {
 			r.process(cmd)
 		}
@@ -177,16 +186,34 @@ func (r *Receiver) process(cmd *protocol.Command) {
 
 // deliverReport sends rep over the WebSocket fast path when it is connected,
 // falling back to the poll queue when the send fails or the path is down.
+// Terminal reports are queued for the poll path even after a successful
+// fast-path send: a nil write only means the bytes hit the local TCP buffer,
+// and on a dying socket the report would vanish, leaving the server stuck at
+// the last non-terminal status. The server deduplicates reports on
+// (commandId, status, timestamp), so the double delivery is harmless.
 func (r *Receiver) deliverReport(rep *protocol.Report) {
+	sent := false
 	if r.push != nil && r.push.Connected() {
 		if err := r.push.SendReport(context.Background(), rep); err == nil {
-			return
+			sent = true
 		} else {
 			r.log.Debug("websocket report fast path failed, queuing for poll",
 				"commandId", rep.CommandID, "status", rep.Status, "error", err)
 		}
 	}
-	r.queue.enqueue(rep)
+	if !sent || isTerminal(rep.Status) {
+		r.queue.enqueue(rep)
+	}
+}
+
+// isTerminal reports whether status ends the command lifecycle. Terminal
+// reports go over both delivery paths so the server never gets stuck.
+func isTerminal(status string) bool {
+	switch status {
+	case protocol.StatusSucceeded, protocol.StatusFailed, protocol.StatusRefused:
+		return true
+	}
+	return false
 }
 
 // commandCtx returns the Run context for WS-pushed commands, or a background
